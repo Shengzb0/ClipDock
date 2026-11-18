@@ -58,6 +58,23 @@ def test_config_broken_file(tmp_path):
     assert Config.load(path) == Config()
 
 
+def test_storage_limits(tmp_path):
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps({"max_image_mb": 800}), encoding="utf-8")   # 0.3 版的写法
+    assert Config.load(path).max_storage_mb == 800
+    path.write_text(json.dumps({"max_items": 0, "max_storage_mb": 2048}), encoding="utf-8")
+    cfg = Config.load(path)
+    assert (cfg.max_items, cfg.max_storage_mb) == (0, 2048)                # 0 表示不限
+    path.write_text(json.dumps({"max_items": 0, "max_storage_mb": 0}), encoding="utf-8")
+    cfg = Config.load(path)
+    assert cfg.max_items == 500 and cfg.max_storage_mb == 0                # 至少留一个上限
+    path.write_text(json.dumps({"max_items": 3, "max_storage_mb": 10 ** 9}), encoding="utf-8")
+    cfg = Config.load(path)
+    assert cfg.max_items == 20 and cfg.max_storage_mb == 100_000           # 超出范围的拉回范围里
+    path.write_text(json.dumps({"max_items": -5}), encoding="utf-8")
+    assert Config.load(path).max_items == 500
+
+
 def test_background_opacity_is_clamped(tmp_path):
     path = tmp_path / "config.json"
     for raw, expected in ((5, 10), (150, 100), (55, 55), ("x", 70), (0.5, 70)):

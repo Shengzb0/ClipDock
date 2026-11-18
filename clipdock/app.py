@@ -27,13 +27,14 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox, QSystemTrayIcon
 
 from . import APP_NAME, __version__, clipdata, placement, win32
-from .config import Config, data_dir
+from .config import ITEMS_RANGE, STORAGE_MB_RANGE, Config, data_dir
 from .hotkey import format_hotkey, parse_hotkey
 from .store import ALL_FAVORITES, HistoryStore, Item, Project
 from .ui import (
     CopyToast,
     HeaderRow,
     ItemRow,
+    LimitDialog,
     NewProjectRow,
     Panel,
     ProjectRow,
@@ -56,6 +57,8 @@ CLIPBOARD_RETRIES = 6
 PASTE_AFTER_FOCUS_MS = 80    # 切回目标窗口后稍等一下再按 Ctrl+V
 CARET_RETRY_MS = 120         # 第一次没问到光标位置时，隔多久再问一次（Chrome 第一次被问时要先准备）
 MAX_IMAGE_BYTES = 30_000_000  # 单张图片（PNG）超过这个大小就不记录
+LIST_LIMIT = 500             # 列表里最多列出这么多条（多了会卡），更早的用搜索找
+MB = 1024 * 1024             # 和 Windows 资源管理器一样按 1024 算
 # 菜单里的“背景”选项：（显示名, 不透明度%）
 OPACITY_LEVELS = [("不透明", 100), ("微透明", 85), ("半透明", 70), ("较透明", 55), ("很透明", 40)]
 
@@ -76,6 +79,28 @@ _APP_NAMES = {
 def friendly_app_name(exe: str) -> str:
     stem = exe[:-4] if exe.lower().endswith(".exe") else exe
     return _APP_NAMES.get(stem.lower(), stem)
+
+
+def human_size(size: int) -> str:
+    """字节数 → “85 MB”“1.2 GB”。"""
+    if size < MB:
+        return f"{round(size / 1024)} KB"
+    mb = size / MB
+    if mb < 1024:
+        return f"{mb:.1f} MB" if mb < 10 else f"{mb:.0f} MB"
+    return f"{mb / 1024:.1f} GB"
+
+
+def items_limit_text(count: int) -> str:
+    return f"最多 {count} 条" if count else "不限"
+
+
+def size_limit_text(mb: int) -> str:
+    if not mb:
+        return "不限"
+    if mb >= 1024 and mb % 1024 == 0:
+        return f"最多 {mb // 1024} GB"
+    return f"最多 {mb} MB"
 
 
 def _copied(summary: str, suffix: str = "") -> str:
@@ -196,6 +221,7 @@ class Controller(QObject):
         self._session_ending = False     # Windows 正在关机/注销
         self._missing: dict[int, bool] = {}  # 文件条目：文件是否已经不在了（每次显示面板时重新检查）
         self._preferred_size = QSize(340, 580)  # 用户拖出来的面板大小；放到光标旁边时为了放得下可能临时变矮
+        self._truncated = False          # 列表是否没列全（超过 LIST_LIMIT 条）
         self._shut_down = False
         self._self_elevated = win32.is_current_process_elevated()
 
@@ -571,7 +597,7 @@ class Controller(QObject):
             return
         self.store.add(cap.text, self._source_name(owner_pid), kind=cap.kind, formats=cap.formats,
                        meta=cap.meta, digest=cap.digest)
-        self.store.trim(self.cfg.max_items, self.cfg.max_image_mb * 1_000_000)
+        self.store.trim(*self._limits())
         self.reload()
         self._feedback(_copied(cap.summary), near)
 
@@ -589,7 +615,7 @@ class Controller(QObject):
         if not text.strip():
             return
         self.store.add(text, source)
-        self.store.trim(self.cfg.max_items)
+        self.store.trim(*self._limits())
         self.reload()
 
     @staticmethod
@@ -607,12 +633,14 @@ class Controller(QObject):
         project = self.store.project(self._project_id) if self._project_id is not None else None
         if self._project_id is not None and project is None:  # 项目刚被删掉
             self._project_id = None
+        self._truncated = False
         if self._tab == "recent":
             rows, empty, style = self._recent_rows(query)
         elif project is None:
             rows, empty, style = self._favorite_rows(query)
         else:
-            rows = [self._item_row(item) for item in self.store.favorites(project.id, query)]
+            items = self._capped(self.store.favorites(project.id, query, limit=LIST_LIMIT + 1))
+            rows = [self._item_row(item) for item in items] + self._more_rows(query)
             empty = (f"项目里没有包含“{query}”的收藏" if query
                      else "这个项目还是空的\n在条目上右键 → 移到项目")
             style = "relative"
@@ -620,7 +648,7 @@ class Controller(QObject):
         self.panel.set_rows(rows, empty, style)
         shown = sum(isinstance(row, ItemRow) for row in rows)
         if query:
-            status = f"找到 {shown} 条"
+            status = f"找到 {shown} 多条" if self._truncated else f"找到 {shown} 条"
         elif self._tab == "recent":
             status = f"共 {total} 条" + (f"，收藏 {favorites} 条" if favorites else "")
             if total:
@@ -630,6 +658,21 @@ class Controller(QObject):
         else:
             status = "收藏的内容会一直保留，不会被自动清理"
         self.panel.set_status(status)
+
+    def _capped(self, items: list[Item]) -> list[Item]:
+        """列表最多列 LIST_LIMIT 条：多查一条，用来知道后面还有没有。"""
+        self._truncated = len(items) > LIST_LIMIT
+        return items[:LIST_LIMIT]
+
+    def _more_rows(self, query: str, total: int | None = None) -> list[HeaderRow]:
+        """列表没列全时，最后加一行说明。"""
+        if not self._truncated:
+            return []
+        if query:
+            return [HeaderRow(f"只列出了前 {LIST_LIMIT} 条，多加个关键词能找得更准")]
+        if total is not None and total > LIST_LIMIT:
+            return [HeaderRow(f"更早的 {total - LIST_LIMIT} 条没有列出来，搜索可以找到")]
+        return [HeaderRow(f"只列出了前 {LIST_LIMIT} 条")]
 
     def _item_row(self, item: Item, project_name: str = "") -> ItemRow:
         missing = False
@@ -642,9 +685,11 @@ class Controller(QObject):
     def _recent_rows(self, query: str):
         rows = []
         now = time.time()
-        for group in burst_groups(self.store.history(query), self.cfg.group_gap_minutes * 60):
+        items = self._capped(self.store.history(query, limit=LIST_LIMIT + 1))
+        for group in burst_groups(items, self.cfg.group_gap_minutes * 60):
             rows.append(HeaderRow(burst_label(group, now)))
             rows.extend(self._item_row(item) for item in group)
+        rows += self._more_rows(query, self.store.counts()[0])
         if query:
             empty = f"没有包含“{query}”的记录"
         else:
@@ -655,18 +700,20 @@ class Controller(QObject):
     def _favorite_rows(self, query: str):
         if query:  # 在全部收藏里搜，每条注明属于哪个项目
             names = {p.id: p.name for p in self.store.projects()}
-            items = self.store.favorites(ALL_FAVORITES, query)
+            items = self._capped(self.store.favorites(ALL_FAVORITES, query, limit=LIST_LIMIT + 1))
             rows = [self._item_row(item, names.get(item.project_id, "")) for item in items]
-            return rows, f"收藏里没有包含“{query}”的内容", "relative"
+            return rows + self._more_rows(query), f"收藏里没有包含“{query}”的内容", "relative"
         projects = self.store.projects()
-        loose = self.store.favorites(None)
+        loose = self._capped(self.store.favorites(None, limit=LIST_LIMIT + 1))
         if not projects and not loose:
             return [], ("还没有收藏\n点条目右上角的 ☆，常用的内容就不用再找了\n"
                         "收藏多了可以建项目分类"), "relative"
         rows = [ProjectRow(p) for p in projects] + [NewProjectRow()]
         if loose:
-            rows.append(HeaderRow(f"{'未分类' if projects else '收藏'} · {len(loose)} 条"))
+            count = f"{len(loose)} 多" if self._truncated else str(len(loose))
+            rows.append(HeaderRow(f"{'未分类' if projects else '收藏'} · {count} 条"))
             rows.extend(self._item_row(item) for item in loose)
+            rows += self._more_rows("")
         return rows, "", "relative"
 
     def _refresh_times(self) -> None:
@@ -916,63 +963,61 @@ class Controller(QObject):
 
     # ---- 菜单与对话框 ----
     def _build_menu(self) -> QMenu:
+        """托盘图标和面板上 ··· 用的同一个菜单：常用的放第一层，设置收进二级菜单。
+
+        显示/隐藏面板、暂停记录
+        呼出位置 ▸ / 背景透明度 ▸ / 存储 ▸（两个上限、关机清除、清空、数据文件夹）
+        复制成功提示、开机自动启动
+        退出
+        """
         menu = QMenu()
-        self.act_toggle = QAction("显示面板", menu)
-        self.act_toggle.triggered.connect(self.toggle_panel)
-        # 按快捷键时面板出现在哪：两个选项二选一
-        self.act_position_title = QAction("按快捷键时：", menu)
-        self.act_position_title.setEnabled(False)
-        self.act_position_caret = QAction("出现在输入光标旁边", menu)
-        self.act_position_last = QAction("出现在上次的位置", menu)
-        position_group = QActionGroup(menu)
-        position_group.setExclusive(True)
-        for action, mode in ((self.act_position_caret, "caret"), (self.act_position_last, "last")):
-            action.setCheckable(True)
-            action.triggered.connect(lambda _checked=False, value=mode: self._set_popup_position(value))
-            position_group.addAction(action)
-        self.act_pause = QAction("暂停记录", menu)
-        self.act_pause.setCheckable(True)
-        self.act_pause.triggered.connect(self._set_paused)
-        self.act_feedback = QAction("复制成功提示", menu)
-        self.act_feedback.setCheckable(True)
-        self.act_feedback.triggered.connect(self._set_copy_feedback)
-        self.act_new_project = QAction("新建项目…", menu)
-        self.act_new_project.triggered.connect(lambda: self._new_project())
-        self.act_clear = QAction("清空历史（保留收藏）…", menu)
-        self.act_clear.triggered.connect(self._clear_history)
-        self.act_clear_on_shutdown = QAction("关机时清除历史（保留收藏）", menu)
-        self.act_clear_on_shutdown.setCheckable(True)
-        self.act_clear_on_shutdown.triggered.connect(self._set_clear_on_shutdown)
-        self.opacity_menu = QMenu("背景", menu)
-        group = QActionGroup(self.opacity_menu)
-        for label, percent in OPACITY_LEVELS:
-            action = QAction(label, self.opacity_menu)
-            action.setCheckable(True)
-            action.setData(percent)
-            action.triggered.connect(lambda _checked=False, value=percent: self._set_opacity(value))
-            group.addAction(action)
-            self.opacity_menu.addAction(action)
-        self.act_autostart = QAction("开机自动启动", menu)
-        self.act_autostart.setCheckable(True)
-        self.act_autostart.triggered.connect(self._set_autostart)
-        self.act_folder = QAction("打开数据文件夹", menu)
-        self.act_folder.triggered.connect(self._open_data_folder)
-        self.act_quit = QAction("退出 ClipDock", menu)
-        self.act_quit.triggered.connect(self.app.quit)
-        for entry in (
-            self.act_toggle, None,
-            self.act_position_title, self.act_position_caret, self.act_position_last, None,
-            self.act_pause, self.act_feedback, None,
-            self.act_new_project, self.act_clear, self.act_clear_on_shutdown, None,
-            self.opacity_menu, self.act_autostart, self.act_folder, None,
-            self.act_quit,
-        ):
-            if entry is None:
-                menu.addSeparator()
-            elif isinstance(entry, QMenu):
-                menu.addMenu(entry)
-            else:
-                menu.addAction(entry)
+
+        def add(parent: QMenu, text: str, slot, checkable: bool = False) -> QAction:
+            action = QAction(text, parent)
+            action.setCheckable(checkable)
+            action.triggered.connect(slot)
+            parent.addAction(action)
+            return action
+
+        def choices(parent: QMenu, options, slot) -> list[QAction]:
+            """一组二选一（或多选一）的选项。"""
+            group = QActionGroup(parent)
+            actions = []
+            for label, value in options:
+                action = add(parent, label, lambda _checked=False, v=value: slot(v), checkable=True)
+                action.setData(value)
+                group.addAction(action)
+                actions.append(action)
+            return actions
+
+        self.act_toggle = add(menu, "显示面板", self.toggle_panel)
+        self.act_pause = add(menu, "暂停记录", self._set_paused, checkable=True)
+        menu.addSeparator()
+
+        self.position_menu = menu.addMenu("呼出位置")
+        self.act_position_caret, self.act_position_last = choices(
+            self.position_menu, [("输入光标旁边", "caret"), ("上次的位置", "last")], self._set_popup_position)
+
+        self.opacity_menu = menu.addMenu("背景透明度")
+        choices(self.opacity_menu, OPACITY_LEVELS, self._set_opacity)
+
+        self.storage_menu = menu.addMenu("存储")
+        self.act_limit_items = add(self.storage_menu, "按条数上限", lambda: self._edit_limit("items"))
+        self.act_limit_size = add(self.storage_menu, "按占用上限", lambda: self._edit_limit("size"))
+        self.act_usage = add(self.storage_menu, "", lambda: None)
+        self.act_usage.setEnabled(False)  # 只是显示现在用了多少
+        self.storage_menu.addSeparator()
+        self.act_clear_on_shutdown = add(self.storage_menu, "关机时清除历史（保留收藏）",
+                                         self._set_clear_on_shutdown, checkable=True)
+        self.act_clear = add(self.storage_menu, "清空历史（保留收藏）…", self._clear_history)
+        self.storage_menu.addSeparator()
+        self.act_folder = add(self.storage_menu, "打开数据文件夹", self._open_data_folder)
+        menu.addSeparator()
+
+        self.act_feedback = add(menu, "复制成功提示", self._set_copy_feedback, checkable=True)
+        self.act_autostart = add(menu, "开机自动启动", self._set_autostart, checkable=True)
+        menu.addSeparator()
+        self.act_quit = add(menu, "退出 ClipDock", self.app.quit)
         menu.aboutToShow.connect(self._sync_menu)
         return menu
 
@@ -980,16 +1025,20 @@ class Controller(QObject):
         hotkey = format_hotkey(self.cfg.hotkey)
         # 快捷键只负责呼出，所以“隐藏面板”后面不写快捷键
         self.act_toggle.setText("隐藏面板" if self.panel.isVisible() else f"显示面板\t{hotkey}")
-        self.act_position_title.setText(f"按 {hotkey} 时：")
-        self.act_position_caret.setChecked(self.cfg.popup_position == "caret")
-        self.act_position_last.setChecked(self.cfg.popup_position != "caret")
         self.act_pause.setChecked(self.cfg.paused)
-        self.act_feedback.setChecked(self.cfg.copy_feedback)
-        self.act_clear_on_shutdown.setChecked(self.cfg.clear_on_shutdown)
-        self.act_autostart.setEnabled(win32.IS_WINDOWS)
-        self.act_autostart.setChecked(is_autostart_enabled())
+        self.position_menu.setTitle(f"呼出位置（{hotkey}）")
+        for action in self.position_menu.actions():
+            action.setChecked(action.data() == self.cfg.popup_position)
         for action in self.opacity_menu.actions():
             action.setChecked(action.data() == self.cfg.background_opacity)
+        self.act_limit_items.setText(f"按条数上限：{items_limit_text(self.cfg.max_items)}…")
+        self.act_limit_size.setText(f"按占用上限：{size_limit_text(self.cfg.max_storage_mb)}…")
+        count, size = self.store.usage()
+        self.act_usage.setText(f"现在：{count} 条，约 {human_size(size)}（收藏不算）")
+        self.act_clear_on_shutdown.setChecked(self.cfg.clear_on_shutdown)
+        self.act_feedback.setChecked(self.cfg.copy_feedback)
+        self.act_autostart.setEnabled(win32.IS_WINDOWS)
+        self.act_autostart.setChecked(is_autostart_enabled())
 
     def _show_main_menu(self, pos: QPoint) -> None:
         target = self._focus_target()
@@ -1081,6 +1130,51 @@ class Controller(QObject):
             removed = self.store.clear(keep_favorites=True)
             self.reload()
             self.panel.show_toast(f"已清空 {removed} 条历史")
+
+    # ---- 存储上限 ----
+    def _limits(self) -> tuple[int | None, int | None]:
+        """(最多几条, 最多几字节)，None 表示不限。"""
+        return (self.cfg.max_items or None,
+                self.cfg.max_storage_mb * MB if self.cfg.max_storage_mb else None)
+
+    def _edit_limit(self, kind: str) -> None:
+        count, size = self.store.usage()
+        if kind == "items":
+            dialog = LimitDialog(
+                "按条数上限", f"历史最多保留多少条（收藏的不算），超出后从最旧的删起。\n现在有 {count} 条。",
+                "条", self.cfg.max_items, 500, ITEMS_RANGE, 100, can_be_unlimited=self.cfg.max_storage_mb > 0)
+        else:
+            dialog = LimitDialog(
+                "按占用上限", f"历史最多占用多少空间（收藏的不算），超出后从最旧的删起。\n现在约 {human_size(size)}。",
+                "MB", self.cfg.max_storage_mb, 300, STORAGE_MB_RANGE, 100, can_be_unlimited=self.cfg.max_items > 0)
+        target = self._focus_target()
+        accepted = bool(dialog.exec())
+        self._restore_focus_after_menu(target)
+        if not accepted:
+            return
+        if kind == "items":
+            self.apply_limits(dialog.value(), self.cfg.max_storage_mb)
+        else:
+            self.apply_limits(self.cfg.max_items, dialog.value())
+
+    def apply_limits(self, max_items: int, max_storage_mb: int) -> bool:
+        """换成新的存储上限。要删掉旧历史时先问一声。0 表示不限，但两个不能都是 0。"""
+        if not max_items and not max_storage_mb:
+            self.panel.show_toast("条数和占用至少要设一个上限", 4000)
+            return False
+        if (max_items, max_storage_mb) == (self.cfg.max_items, self.cfg.max_storage_mb):
+            return True
+        doomed = self.store.excess(max_items or None, max_storage_mb * MB if max_storage_mb else None)
+        if doomed and not self._confirm(
+                "调整存储上限", f"按新的上限，最旧的 {doomed} 条历史会被删掉（收藏不受影响）。\n确定吗？"):
+            return False
+        self.cfg.max_items, self.cfg.max_storage_mb = max_items, max_storage_mb
+        self._save_config()
+        removed = self.store.trim(*self._limits())
+        self.reload()
+        message = f"存储上限：{items_limit_text(max_items)}，{size_limit_text(max_storage_mb)}"
+        self.panel.show_toast(message + (f"；删掉了 {removed} 条旧历史" if removed else ""), 4000)
+        return True
 
     def _set_popup_position(self, mode: str) -> None:
         self.cfg.popup_position = mode

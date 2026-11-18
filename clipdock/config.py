@@ -32,14 +32,17 @@ def data_dir() -> Path:
 
 
 POPUP_POSITIONS = ("caret", "last")
+ITEMS_RANGE = (20, 100_000)        # 按条数上限能设的范围
+STORAGE_MB_RANGE = (10, 100_000)   # 按占用上限能设的范围（MB）
+_ZERO_MEANS_UNLIMITED = {"max_items", "max_storage_mb"}
 
 
 @dataclass
 class Config:
     hotkey: str = "win+alt+v"          # 呼出面板的全局快捷键
     popup_position: str = "caret"      # 按快捷键时面板出现在哪："caret" 输入光标旁边，"last" 上次的位置
-    max_items: int = 500               # 最多保留多少条未收藏的记录（收藏的不算）
-    max_image_mb: int = 300            # 未收藏的图片等数据最多占多少 MB，超出时从最旧的删起
+    max_items: int = 500               # 按条数上限：最多保留多少条历史（收藏的不算），0 表示不限
+    max_storage_mb: int = 300          # 按占用上限：历史最多占多少 MB（收藏的不算），0 表示不限
     max_text_chars: int = 200_000      # 单条最多多少字，超过的不记录
     hide_when_fullscreen: bool = True  # 前台是全屏程序时自动隐藏
     show_on_start: bool = True         # 启动时显示面板
@@ -62,6 +65,8 @@ class Config:
             return cfg
         if not isinstance(raw, dict):
             return cfg
+        if "max_storage_mb" not in raw and "max_image_mb" in raw:  # 0.3 版叫 max_image_mb
+            raw["max_storage_mb"] = raw["max_image_mb"]
         for f in fields(cls):
             if f.name not in raw:
                 continue
@@ -80,14 +85,20 @@ class Config:
                 if isinstance(value, bool):
                     setattr(cfg, f.name, value)
             elif isinstance(default, int):
-                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                lowest = 0 if f.name in _ZERO_MEANS_UNLIMITED else 1
+                if isinstance(value, int) and not isinstance(value, bool) and value >= lowest:
                     setattr(cfg, f.name, value)
             elif isinstance(default, str):
                 if isinstance(value, str) and value.strip():
                     setattr(cfg, f.name, value.strip())
         cfg.background_opacity = max(10, min(100, cfg.background_opacity))
         cfg.group_gap_minutes = max(1, min(240, cfg.group_gap_minutes))
-        cfg.max_image_mb = max(20, min(10_000, cfg.max_image_mb))
+        if cfg.max_items:
+            cfg.max_items = max(ITEMS_RANGE[0], min(ITEMS_RANGE[1], cfg.max_items))
+        if cfg.max_storage_mb:
+            cfg.max_storage_mb = max(STORAGE_MB_RANGE[0], min(STORAGE_MB_RANGE[1], cfg.max_storage_mb))
+        if not cfg.max_items and not cfg.max_storage_mb:  # 两个都不限的话会无限增长：至少留一个
+            cfg.max_items = 500
         if cfg.popup_position not in POPUP_POSITIONS:
             cfg.popup_position = "caret"
         return cfg

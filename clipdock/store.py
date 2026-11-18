@@ -24,7 +24,7 @@ from pathlib import Path
 log = logging.getLogger("clipdock")
 
 PREVIEW_CHARS = 600
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ALL_FAVORITES = -1  # favorites(ALL_FAVORITES) 表示所有收藏，不分项目
 
 _CREATE = """
@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS items (
     favorited_at REAL,
     project_id   INTEGER,
     use_count    INTEGER NOT NULL DEFAULT 0,
-    meta         TEXT    NOT NULL DEFAULT '{}'
+    meta         TEXT    NOT NULL DEFAULT '{}',
+    size         INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_items_last_copied ON items(last_copied);
 CREATE TABLE IF NOT EXISTS formats (
@@ -67,7 +68,14 @@ _NEW_COLUMNS = {
     "favorited_at": "REAL",
     "project_id": "INTEGER",
     "meta": "TEXT NOT NULL DEFAULT '{}'",
+    "size": "INTEGER NOT NULL DEFAULT 0",
 }
+
+# 一条记录占多少字节：文字本身 + 附带的格式数据（图片、HTML 等）
+_SIZE_OF = (
+    "LENGTH(CAST(text AS BLOB)) + "
+    "COALESCE((SELECT SUM(LENGTH(f.data)) FROM formats f WHERE f.item_id = items.id), 0)"
+)
 
 _SELECT = (
     "SELECT id, kind, substr(text, 1, ?), length(text), source, created_at, last_copied, "
@@ -148,12 +156,14 @@ class HistoryStore:
             for name, ddl in _NEW_COLUMNS.items():
                 if name not in columns:
                     self._conn.execute(f"ALTER TABLE items ADD COLUMN {name} {ddl}")
-            if version < SCHEMA_VERSION and "pinned" in columns:
+            if version < 2 and "pinned" in columns:
                 # 旧版的“固定”合并进“收藏”
                 self._conn.execute(
                     "UPDATE items SET favorite = 1, favorited_at = COALESCE(pinned_at, last_copied) "
                     "WHERE pinned = 1"
                 )
+            if version < 3:  # 记下每条占多少空间，按占用上限清理时用
+                self._conn.execute(f"UPDATE items SET size = {_SIZE_OF}")
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         if self._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 0:
             # 旧版建的数据库还没开自动回收空间：整理一次（旧版只有文字，很快）
@@ -212,6 +222,7 @@ class HistoryStore:
                     "INSERT INTO formats (item_id, name, data) VALUES (?, ?, ?)",
                     [(item_id, name, sqlite3.Binary(data)) for name, data in formats.items()],
                 )
+            self._conn.execute(f"UPDATE items SET size = {_SIZE_OF} WHERE id = ?", (item_id,))
         return self.get(item_id)
 
     def set_favorite(self, item_id: int, favorite: bool) -> None:
@@ -252,33 +263,45 @@ class HistoryStore:
         self._release_space()
         return removed
 
-    def trim(self, max_items: int, max_bytes: int | None = None) -> int:
-        """只保留最近的 max_items 条未收藏的记录；给了 max_bytes 时，
-        未收藏记录的附带数据（主要是图片）合计也不超过这么多字节，超出时从最旧的删起。
-        最新的一条总会保留。返回删掉的条数。收藏的内容不受影响。"""
+    def usage(self) -> tuple[int, int]:
+        """未收藏的历史：(条数, 占用字节数)。收藏的不算在存储上限里。"""
+        count, size = self._conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM items WHERE favorite = 0"
+        ).fetchone()
+        return int(count), int(size)
+
+    def _over_limit(self, max_items: int | None, max_bytes: int | None) -> list[int]:
+        """超出上限、要删掉的记录：从最旧的开始。max_items / max_bytes 为 None 表示不限。
+        最新的一条总会留下（哪怕它一条就超过了占用上限）。收藏的不算。"""
+        count, size = self.usage()
+        if (max_items is None or count <= max_items) and (max_bytes is None or size <= max_bytes):
+            return []
+        rows = self._conn.execute(
+            "SELECT id, size FROM items WHERE favorite = 0 ORDER BY last_copied DESC, id DESC"
+        )
+        doomed, total = [], 0
+        for index, (item_id, item_size) in enumerate(rows):
+            total += item_size
+            too_many = max_items is not None and index >= max_items
+            too_big = max_bytes is not None and total > max_bytes and index > 0
+            if too_many or too_big:
+                doomed.append(item_id)
+        return doomed
+
+    def excess(self, max_items: int | None, max_bytes: int | None = None) -> int:
+        """按这样的上限，要删掉几条（只算，不删）。"""
+        return len(self._over_limit(max_items, max_bytes))
+
+    def trim(self, max_items: int | None, max_bytes: int | None = None) -> int:
+        """历史超出上限时从最旧的删起：最多 max_items 条、合计最多 max_bytes 字节（None 表示不限）。
+        返回删掉的条数。收藏的内容不受影响。"""
+        doomed = self._over_limit(max_items, max_bytes)
+        if not doomed:
+            return 0
         with self._conn:
-            removed = self._conn.execute(
-                "DELETE FROM items WHERE favorite = 0 AND id NOT IN ("
-                "  SELECT id FROM items WHERE favorite = 0 ORDER BY last_copied DESC, id DESC LIMIT ?"
-                ")",
-                (max(0, int(max_items)),),
-            ).rowcount
-            if max_bytes is not None:
-                sizes = self._conn.execute(
-                    "SELECT i.id, SUM(LENGTH(f.data)) FROM items i JOIN formats f ON f.item_id = i.id "
-                    "WHERE i.favorite = 0 GROUP BY i.id ORDER BY i.last_copied DESC, i.id DESC"
-                ).fetchall()
-                total, doomed = 0, []
-                for index, (item_id, size) in enumerate(sizes):
-                    total += size or 0
-                    if total > max_bytes and index > 0:
-                        doomed.append((item_id,))
-                if doomed:
-                    self._conn.executemany("DELETE FROM items WHERE id = ?", doomed)
-                    removed += len(doomed)
-        if removed:
-            self._release_space()
-        return removed
+            self._conn.executemany("DELETE FROM items WHERE id = ?", [(item_id,) for item_id in doomed])
+        self._release_space()
+        return len(doomed)
 
     # ---- 项目 ----
 
@@ -322,7 +345,7 @@ class HistoryStore:
             params.append(int(limit))
         return [self._to_item(r) for r in self._conn.execute(sql, [PREVIEW_CHARS, *params])]
 
-    def favorites(self, project_id: int | None = None, query: str = "") -> list[Item]:
+    def favorites(self, project_id: int | None = None, query: str = "", limit: int | None = None) -> list[Item]:
         """收藏：project_id 为 None 表示未分类的，ALL_FAVORITES 表示全部。最近收藏的在前。"""
         conditions, params = _search_conditions(query)
         conditions.insert(0, "favorite = 1")
@@ -332,6 +355,9 @@ class HistoryStore:
             conditions.insert(1, "project_id = ?")
             params.insert(0, project_id)
         sql = f"{_SELECT} WHERE {' AND '.join(conditions)} ORDER BY favorited_at DESC, id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
         return [self._to_item(r) for r in self._conn.execute(sql, [PREVIEW_CHARS, *params])]
 
     def get(self, item_id: int) -> Item | None:

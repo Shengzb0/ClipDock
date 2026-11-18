@@ -47,6 +47,9 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileIconProvider,
     QFrame,
     QHBoxLayout,
@@ -54,6 +57,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListView,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QStyledItemDelegate,
     QToolButton,
@@ -1459,6 +1463,53 @@ class SearchPopup(QWidget):
 # ---------------------------------------------------------------------------
 # 复制成功提示
 # ---------------------------------------------------------------------------
+class LimitDialog(QDialog):
+    """改一个存储上限：数字框 + “不限”。另一个上限已经是“不限”时，这里不能再选“不限”。"""
+
+    def __init__(self, title: str, text: str, unit: str, value: int, default: int,
+                 value_range: tuple[int, int], step: int, can_be_unlimited: bool) -> None:
+        super().__init__()
+        self.setWindowTitle(title)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)  # 别被置顶的面板挡住
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        layout = QVBoxLayout(self)
+        label = QLabel(text)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        row = QHBoxLayout()
+        self.spin = QSpinBox()
+        self.spin.setRange(*value_range)
+        self.spin.setSingleStep(step)
+        self.spin.setSuffix(f" {unit}")
+        self.spin.setGroupSeparatorShown(True)
+        self.spin.setValue(value or default)
+        self.spin.setMinimumWidth(140)
+        self.unlimited = QCheckBox("不限")
+        self.unlimited.setChecked(value == 0)
+        self.unlimited.setEnabled(can_be_unlimited or value == 0)
+        self.spin.setEnabled(value != 0)
+        self.unlimited.toggled.connect(lambda checked: self.spin.setEnabled(not checked))
+        row.addWidget(self.spin, 1)
+        row.addWidget(self.unlimited)
+        layout.addLayout(row)
+        if not self.unlimited.isEnabled():
+            hint = QLabel("另一个上限已经是“不限”，这里至少要设一个上限，否则历史会一直变多。")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: gray;")
+            layout.addWidget(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setMinimumWidth(340)
+
+    def value(self) -> int:
+        """0 表示不限。"""
+        return 0 if self.unlimited.isChecked() else self.spin.value()
+
+
 class CopyToast(QWidget):
     """复制成功时在鼠标旁边弹出的小提示：不抢焦点、鼠标可以穿透、一秒多后淡出。"""
 

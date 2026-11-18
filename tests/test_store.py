@@ -161,8 +161,43 @@ def test_trim_by_bytes_keeps_favorites_and_newest(tmp_path):
     assert removed == 2
     left = {i.preview for i in store.history()}
     assert left == {"纯文字", "图片 4", "图片 3", "图片 0"}
-    assert store.trim(500, max_bytes=10) == 1   # 预算再小，最新的一张也留着
-    assert {i.preview for i in store.history()} == {"纯文字", "图片 4", "图片 0"}
+    assert store.trim(500, max_bytes=10) == 2   # 预算再小，最新的一条也留着
+    assert {i.preview for i in store.history()} == {"纯文字", "图片 0"}
+
+
+def test_size_counts_text_and_formats(tmp_path):
+    store = HistoryStore(tmp_path / "h.db")
+    store.add("中文", now=1)                                       # 6 字节
+    item = store.add("加粗", now=2, formats={"text/html": b"<b>x</b>"})  # 6 + 8
+    assert store.usage() == (2, 6 + 6 + 8)
+    store.add("加粗", now=3, formats={})                            # 再复制一次，格式换掉了
+    assert store.usage() == (2, 12)
+    store.set_favorite(item.id, True)                              # 收藏的不算
+    assert store.usage() == (1, 6)
+
+
+def test_limits_can_be_unlimited_and_previewed(tmp_path):
+    store = HistoryStore(tmp_path / "h.db")
+    for i in range(30):
+        store.add(f"第{i:04d}条", now=i)                            # 每条 10 字节
+    assert store.excess(None, None) == 0
+    assert store.excess(20) == 10 and store.excess(None, 105) == 20
+    assert store.excess(25, 155) == 15                             # 两个上限，哪个先到按哪个
+    assert store.usage()[0] == 30                                  # excess 只算不删
+    assert store.trim(None, 105) == 20
+    assert [i.preview for i in store.history()][:2] == ["第0029条", "第0028条"]
+    assert store.trim(None, None) == 0
+
+
+def test_migrates_v2_database_sizes(tmp_path):
+    path = tmp_path / "v2.db"
+    store = HistoryStore(path)
+    store.add("中文", now=1, formats={"image/png": b"12345"})
+    store._conn.execute("UPDATE items SET size = 0")
+    store._conn.execute("PRAGMA user_version = 2")
+    store._conn.commit()
+    store.close()
+    assert HistoryStore(path).usage() == (1, 6 + 5)               # 打开时补算每条的大小
 
 
 def test_space_is_released_after_clear(tmp_path):

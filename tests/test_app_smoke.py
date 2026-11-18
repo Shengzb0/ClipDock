@@ -599,3 +599,88 @@ def test_shutdown_is_idempotent_and_helpers(env):
     ctrl.shutdown()  # aboutToQuit 和 main 的 finally 都会调用
     assert app_module.friendly_app_name("WeChat.exe") == "微信"
     assert app_module.paths_missing(["\\\\server\\share\\a.txt"]) is False  # 网络路径不检查
+
+
+# ---------------------------------------------------------------------------
+# 菜单整理、存储上限、列表只列前 500 条
+# ---------------------------------------------------------------------------
+def menu_texts(menu):
+    return [a.text() for a in menu.actions() if not a.isSeparator()]
+
+
+def test_menu_is_grouped(env):
+    ctrl, fake, store = env
+    ctrl.record_text("一条")
+    ctrl._sync_menu()
+    assert menu_texts(ctrl.menu) == [
+        "隐藏面板", "暂停记录",
+        "呼出位置（Win+Alt+V）", "背景透明度", "存储",
+        "复制成功提示", "开机自动启动",
+        "退出 ClipDock",
+    ]
+    assert menu_texts(ctrl.position_menu) == ["输入光标旁边", "上次的位置"]
+    assert menu_texts(ctrl.storage_menu) == [
+        "按条数上限：最多 500 条…", "按占用上限：最多 300 MB…", "现在：1 条，约 0 KB（收藏不算）",
+        "关机时清除历史（保留收藏）", "清空历史（保留收藏）…", "打开数据文件夹",
+    ]
+    assert not ctrl.act_usage.isEnabled()
+    ctrl.position_menu.actions()[1].trigger()          # 二级菜单里点“上次的位置”
+    assert ctrl.cfg.popup_position == "last"
+    ctrl._sync_menu()
+    assert [a.isChecked() for a in ctrl.position_menu.actions()] == [False, True]
+
+
+def test_change_limits_asks_before_deleting(env, monkeypatch, tmp_path):
+    ctrl, fake, store = env
+    for i in range(30):
+        store.add(f"第{i:04d}条", now=1000 + i)
+    asked = []
+    monkeypatch.setattr(ctrl, "_confirm", lambda title, text: asked.append(text) or False)
+    assert not ctrl.apply_limits(20, 300)                # 会删 10 条：先问，用户点了取消
+    assert store.usage()[0] == 30 and ctrl.cfg.max_items == 500 and "10 条" in asked[0]
+    monkeypatch.setattr(ctrl, "_confirm", lambda title, text: True)
+    assert ctrl.apply_limits(20, 300)
+    assert store.usage()[0] == 20 and "删掉了 10 条" in ctrl.panel.status.text()
+    saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert (saved["max_items"], saved["max_storage_mb"]) == (20, 300)
+    assert not ctrl.apply_limits(0, 0)                   # 两个都不限：不行
+    assert ctrl.apply_limits(0, 2048)                    # 只按占用：不删东西，不用问
+    ctrl._sync_menu()
+    assert ctrl.act_limit_items.text() == "按条数上限：不限…"
+    assert ctrl.act_limit_size.text() == "按占用上限：最多 2 GB…"
+
+
+def test_limit_dialog_from_menu(env, monkeypatch):
+    ctrl, fake, store = env
+    opened = []
+
+    class FakeDialog:
+        def __init__(self, title, text, unit, value, default, value_range, step, can_be_unlimited):
+            opened.append((title, unit, value, can_be_unlimited))
+
+        def exec(self):
+            return 1
+
+        def value(self):
+            return 0  # 选了“不限”
+
+    monkeypatch.setattr(app_module, "LimitDialog", FakeDialog)
+    ctrl.act_limit_items.trigger()
+    assert opened[-1] == ("按条数上限", "条", 500, True) and ctrl.cfg.max_items == 0
+    ctrl.act_limit_size.trigger()                        # 条数已经不限了：占用不能再选不限
+    assert opened[-1] == ("按占用上限", "MB", 300, False) and ctrl.cfg.max_storage_mb == 300
+
+
+def test_long_history_lists_only_the_latest(env):
+    ctrl, fake, store = env
+    for i in range(app_module.LIST_LIMIT + 20):
+        store.add(f"记录 {i}", now=1000 + i * 600)        # 间隔 10 分钟，每条一组
+    ctrl.reload()
+    items = [r for r in rows(ctrl) if isinstance(r, ItemRow)]
+    assert len(items) == app_module.LIST_LIMIT and items[0].item.preview == f"记录 {app_module.LIST_LIMIT + 19}"
+    assert rows(ctrl)[-1].label == "更早的 20 条没有列出来，搜索可以找到"
+    ctrl._set_query("记录")
+    assert ctrl.panel.status.text().startswith(f"找到 {app_module.LIST_LIMIT} 多条")
+    assert rows(ctrl)[-1].label.startswith("只列出了前")
+    ctrl._set_query("记录 7")                              # 关键词更具体：全列出来
+    assert not ctrl._truncated
